@@ -1,0 +1,32 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  namespace: elasticsearch
+  name: kibana
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    nginx.org/client-max-body-size: "128M"
+    nginx.ingress.kubernetes.io/proxy-body-size: "128M"
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+spec:
+  rules:
+  - host: kibana.fidibo.net
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: kibana
+            port:
+              number: 5601
+  - host: kibana.fidibo.net
+    http:
+      paths:
+      - backend:
+          service:
+            name: kibana
+            port:
+              number: 5601
+        path: /
+        pathType: Prefix

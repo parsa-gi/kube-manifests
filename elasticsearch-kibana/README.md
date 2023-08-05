@@ -67,3 +67,4 @@ kubectl delete -f elasticsearch_configmap.yaml
 kubectl delete -f elasticsearch_statefulset.yaml
 kubectl delete -f kibana.yaml
 ```
+Note: Be careful with the delete command, as it will delete the services and all data stored in the PVCs.

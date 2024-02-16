@@ -1,0 +1,161 @@
+---
+- hosts: all
+  become: true
+  tasks:
+    # Common tasks for all nodes
+    - name: Install packages that allow apt to be used over HTTPS
+      apt:
+        name: "{{ packages }}"
+        state: present
+        update_cache: yes
+      vars:
+        packages:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - software-properties-common
+
+    - name: Configure resolv.conf
+      lineinfile:
+        path: /etc/resolv.conf
+        insertbefore: BOF
+        line: nameserver 194.5.206.38
+
+    - name: Add an apt signing key for Kubernetes
+      apt_key:
+        url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+        state: present
+
+    - name: Adding apt repository for Kubernetes
+      apt_repository:
+        repo: deb https://apt.kubernetes.io/ kubernetes-xenial main
+        state: present
+        filename: kubernetes.list
+
+    - name: Install containerd
+      apt:
+        name: containerd
+        state: present
+        update_cache: yes
+
+    - name: Configure containerd and restart service
+      block:
+        - name: Create containerd configuration file
+          command: mkdir -p /etc/containerd
+
+        - name: Generate default containerd configuration
+          command: containerd config default > /etc/containerd/config.toml
+
+        - name: Restart containerd
+          service:
+            name: containerd
+            state: restarted
+            enabled: yes
+
+    - name: Remove swapfile from /etc/fstab
+      mount:
+        name: "{{ item }}"
+        fstype: swap
+        state: absent
+      with_items:
+        - swap
+        - none
+
+    - name: Disable swap
+      command: swapoff -a
+      when: ansible_swaptotal_mb > 0
+
+    - name: Install Kubernetes binaries
+      apt:
+        name: "{{ packages }}"
+        state: present
+        update_cache: yes
+      vars:
+        packages:
+          - kubelet
+          - kubeadm
+          - kubectl
+
+    - name: Hold Kubernetes packages
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubeadm
+        - kubelet
+        - kubectl
+
+    # Tasks specific for the primary master node
+    - block:
+        - name: Initialize the Kubernetes cluster using kubeadm
+          shell: kubeadm init --apiserver-advertise-address="172.16.16.10" --apiserver-cert-extra-sans="172.16.16.10"  --node-name master1 --control-plane-endpoint="172.16.16.1:6443" --upload-certs --pod-network-cidr=10.142.0.0/16 > ./init.txt
+        - name: Setup kubeconfig for vagrant user
+          command: "{{ item }}"
+          loop:
+           - mkdir -p /home/vagrant/.kube
+           - cp -i /etc/kubernetes/admin.conf /home/vagrant/.kube/config
+           - chown vagrant:vagrant /home/vagrant/.kube/config
+        - name: Generate join command
+          command: kubeadm token create --print-join-command
+          register: join_command
+        - name: Copy join command to local file
+          local_action: copy content="{{ join_command.stdout_lines[0] }}" dest="./join-command"
+        - name: Copy admin.conf
+          command: cp /etc/kubernetes/admin.conf /vagrant/.
+        - name: Install Helm
+          shell: >
+            curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3
+            && chmod 700 get_helm.sh
+            && ./get_helm.sh
+          args:
+            creates: /usr/local/bin/helm
+
+        - name: Install Metrics Server using Helm
+          shell: helm install metrics-server stable/metrics-server --set args={--kubelet-insecure-tls,--kubelet-preferred-address-types=InternalIP\,ExternalIP\,Hostname}
+          environment:
+            KUBECONFIG: "/etc/kubernetes/admin.conf"
+
+        - name: Install Calico CNI
+          shell: kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml
+          environment:
+            KUBECONFIG: "/etc/kubernetes/admin.conf"
+      when: ansible_hostname == "master1"
+
+    # Tasks specific for the secondary master node
+    - block:
+        - name: Join command
+          shell: cat init.txt | grep -m1 -B 2 "certificate-key" > cm.sh
+        - name: Add API server
+          shell: sed -e '3s/$/ --apiserver-advertise-address="172.16.16.20" --v=9 /' cm.sh > master-join.sh
+        - name: Join copy
+          copy: src=master-join.sh dest=/tmp/join-command.sh mode=0777
+        - name: Run join command
+          command: sh /tmp/join-command.sh
+        - name: Setup kubeconfig for vagrant user
+          command: "{{ item }}"
+          loop:
+           - mkdir -p /home/vagrant/.kube
+           - cp -i /etc/kubernetes/admin.conf /home/vagrant/.kube/config
+           - chown vagrant:vagrant /home/vagrant/.kube/config
+      when: ansible_hostname == "master2"
+
+    # Tasks specific for worker nodes
+    - block:
+        - name: Creating an empty file for kubelet settings
+          file:
+            path: "/etc/default/kubelet"
+            state: touch
+        - name: Configure node IP for kubelet
+          lineinfile:
+            path: /etc/default/kubelet
+            line: "KUBELET_EXTRA_ARGS=--node-ip={{ node_ip }}"
+        - name: Restart kubelet
+          service:
+            name: kubelet
+            daemon_reload: yes
+            state: restarted
+        - name: Copy the join command to server location
+          copy: src=join-command dest=/tmp/join-command.sh mode=0777
+        - name: Join the node to cluster
+          command: sh /tmp/join-command.sh
+      when: ansible_hostname in ["workernode-1", "workernode-2", "workernode-3"]
